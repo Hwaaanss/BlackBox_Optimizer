@@ -1,0 +1,111 @@
+recall 값이 1인 사람들과 일부 허점이 발견된 탓일까 주최측에서 데이터를 교체하고, 리더보드를 초기화했다.
+그저 데이터의 규모만 달라지고 column의 개수는 동일하길래 나는 같은 코드를 사용하고 하이퍼파라미터 튜닝만 다시 하면 될줄 알았다. 하지만 결과는 채점 점수가 바닥을 치는 모습을 볼 수 있었다. 따라서 코드를 다시 구성하기로 생각했다.
+
+<변경사항>
+1. box-cox 변환을 통해 데이터들을 정규분포에 가깝도록 전처리. (기존 Standard Scaler)
+2. 옵티마이저를 Adam을 사용함으로써 각종 문제들(Local Minima, saddle point 등)에서 탈출하기에 유리하도록 설정.
+3. Reduce LR On Plateau를 통해 학습이 반복될 때 loss 값이 개선되지 않으면 lr를 조정해서 plateau 탈출을 꾀함.
+
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from scipy.stats import boxcox
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+import os
+
+# 데이터 로드
+train_data = pd.read_csv('train.csv')
+test_data = pd.read_csv('test.csv')
+submission_template = pd.read_csv('sample_submission.csv')  # 예측 결과를 저장할 템플릿 파일
+
+# ID 제거 및 타겟 변수 분리
+train_data.drop(columns=['ID'], inplace=True)
+target = train_data.pop('y')
+
+# 테스트 데이터에서 ID 제거
+test_ids = test_data.pop('ID')  # 나중에 다시 사용하기 위해 ID를 보관
+
+# y 값이 모두 양수인지 확인
+if (target <= 0).any():
+    raise ValueError("Box-Cox 변환은 y 값이 양수일 때만 사용할 수 있습니다.")
+
+# y 값에 박스-콕스 변환 적용
+y_boxcox, lambda_value = boxcox(target)
+
+# 입력 변수에 대한 스케일링
+scaler_X = StandardScaler()
+X_scaled = scaler_X.fit_transform(train_data)
+
+# LSTM 입력 형태로 변환
+timesteps = 10
+X_lstm = []
+y_lstm = []
+
+# 시퀀스 데이터 생성
+for i in range(len(X_scaled) - timesteps):
+    X_lstm.append(X_scaled[i:i + timesteps])
+    y_lstm.append(y_boxcox[i + timesteps])
+
+X_lstm = np.array(X_lstm)
+y_lstm = np.array(y_lstm)
+
+# 모델 생성 함수
+def create_model(units=64, dropout_rate=0.2, learning_rate=0.001, beta_1=0.9, beta_2=0.999):
+    model = Sequential()
+    model.add(LSTM(units, return_sequences=True, input_shape=(X_lstm.shape[1], X_lstm.shape[2])))
+    model.add(Dropout(dropout_rate))
+    model.add(LSTM(units))
+    model.add(Dropout(dropout_rate))
+    model.add(Dense(1))
+
+    # Adam 옵티마이저 생성, beta_1과 beta_2를 명시적으로 설정
+    optimizer = Adam(learning_rate=learning_rate, beta_1=0.99, beta_2=0.99)
+    model.compile(optimizer=optimizer, loss='mean_squared_error')
+    return model
+
+# 모델 생성 - unit을 128로 하면 overfitting 발생. 64로 일단 고정하고 epoch은 조정 대상
+model = create_model(units=50, dropout_rate=0.3, learning_rate=0.1)
+
+# ReduceLROnPlateau 콜백 설정
+reduce_lr = ReduceLROnPlateau(monitor='loss', factor=0.1, patience=3, min_lr=1e-6, verbose=1)
+
+# 모델 학습
+model.fit(X_lstm, y_lstm, epochs=70, batch_size=64, callbacks=[reduce_lr], verbose=2)
+
+# 모델과 가중치 저장
+os.makedirs('./model_saved/', exist_ok=True)
+model.save('./model_saved/lstm_solved_model.keras')  # 모델 저장
+model.save_weights('./model_saved/lstm_solved_weights.weights.h5')  # 가중치 저장
+
+# 테스트 데이터 예측 준비
+test_data_scaled = scaler_X.transform(test_data)
+
+# 예측 결과를 저장할 리스트 초기화
+y_test_pred_list = []
+
+# 한 개씩 시퀀스를 만들어 예측
+for i in range(len(test_data_scaled)):
+    if i < timesteps:
+        # 처음 몇 개는 충분한 시퀀스가 없으므로 train 데이터의 일부를 사용
+        X_test_sequence = np.vstack([X_scaled[-(timesteps - i):], test_data_scaled[:i + 1]])
+    else:
+        # 그 이후는 test 데이터만 사용
+        X_test_sequence = test_data_scaled[i - timesteps + 1:i + 1]
+
+    X_test_sequence = np.expand_dims(X_test_sequence, axis=0)  # 차원 확장
+    y_test_pred_scaled = model.predict(X_test_sequence)
+    y_test_pred_boxcox = y_test_pred_scaled.flatten()
+    y_test_pred = np.power(y_test_pred_boxcox * lambda_value + 1, 1 / lambda_value)  # 역변환
+    y_test_pred_list.append(y_test_pred)
+
+# 예측 결과를 DataFrame으로 변환
+output = pd.DataFrame({'ID': test_ids, 'y': y_test_pred_list})
+output['y'] = output['y'].astype(str)  # 먼저 문자열로 변환
+output['y'] = output['y'].str.replace('[', '', regex=False).str.replace(']', '', regex=False).astype(float)
+
+# 결과 저장
+output.to_csv('submission_boxcox_20epoch.csv', index=False)
